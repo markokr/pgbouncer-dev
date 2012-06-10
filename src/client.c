@@ -31,6 +31,154 @@ static const char *hdr2hex(const struct MBuf *data, char *buf, unsigned buflen)
 	return bin2hex(bin, dlen, buf, buflen);
 }
 
+static bool handle_parse(PgSocket *client, PktHdr *pkt)
+{
+	struct ClientPlan *plan;
+	const char *name;
+	bool ok;
+
+	ok = mbuf_get_string(&pkt->data, &name);
+	if (!ok) {
+		/* FIXME */
+		if (mbuf_written(&pkt->data) >= SBUF_SMALL_PKT)
+			disconnect_client(client, true, "broken parse pkt");
+		return false;
+	}
+	slog_warning(client, "handle_parse: plan_name=%s", name);
+
+	if (!cf_cache_plans) {
+		if ((name[0] == 0) || cf_pool_mode == POOL_SESSION) {
+			/* passthru */
+			sbuf_prepare_send(&client->sbuf, &client->link->sbuf, pkt->len);
+			return true;
+		} else {
+			/* if caching off, throw error */
+			disconnect_client(client, true, "prepared plans not allowed");
+			return false;
+		}
+	}
+
+	slog_warning(client, "handle_parse: looking up: %s", name);
+	plan = client_plan_lookup(client, name);
+	if (plan) {
+		disconnect_client(client, true, "plan already registered");
+		return false;
+	}
+
+	slog_warning(client, "handle_parse: starting plan parse");
+	ok = plan_load_start(client, pkt->len, name);
+	slog_warning(client, "handle_parse: result=%d", ok);
+	if (ok)
+		sbuf_prepare_fetch(&client->sbuf, pkt->len);
+	return ok;
+}
+
+static bool rewrite_and_send_bind(PgSocket *client, const char *portal_name,
+				  const char *old_name, int old_len,
+				  const ServerPlan *splan)
+{
+	SBuf *sbuf = &client->sbuf;
+	const char *new_name = splan->plan->name;
+	uint8_t tmpbuf[128];
+	PktBuf hdr;
+	int diff = strlen(new_name) - strlen(old_name);
+	int new_len = old_len + diff;
+	int new_hdr, old_hdr;
+	bool ok;
+
+	pktbuf_static(&hdr, tmpbuf, sizeof(tmpbuf));
+	pktbuf_put_char(&hdr, 'B');
+	pktbuf_put_uint32(&hdr, new_len - 1);
+	pktbuf_put_string(&hdr, portal_name);
+	pktbuf_put_string(&hdr, new_name);
+	new_hdr = pktbuf_written(&hdr);
+	old_hdr = new_hdr - diff;
+
+	ok = sbuf_rewrite_header(sbuf, old_hdr, tmpbuf, new_hdr);
+	if (!ok) {
+		disconnect_client(client, true, "failed to rewrite Bind pkt");
+		return false;
+	}
+	sbuf_prepare_send(sbuf, &client->link->sbuf, new_len);
+	return true;
+}
+
+static bool handle_bind(PgSocket *client, PktHdr *pkt)
+{
+	ClientPlan *cplan;
+	ServerPlan *splan;
+	const char *portal_name, *plan_name;
+	bool ok;
+
+	/* it did not fit into SMALL_PKT */
+	ok = mbuf_get_string(&pkt->data, &portal_name);
+	if (!ok)
+		goto failed;
+	ok = mbuf_get_string(&pkt->data, &plan_name);
+	if (!ok)
+		goto failed;
+
+	cplan = client_plan_lookup(client, plan_name);
+	if (!cplan) {
+		disconnect_client(client, true, "unknown plan");
+		return false;
+	}
+
+	splan = server_plan_lookup(client->link, cplan->plan);
+	if (!splan) {
+		disconnect_client(client, true, "separate bind not supported yet");
+		return false;
+	}
+	
+	return rewrite_and_send_bind(client, portal_name, plan_name, pkt->len, splan);
+failed:
+	disconnect_client(client, true, "broken bind pkt");
+	return false;
+}
+
+static bool handle_close(PgSocket *client, PktHdr *pkt)
+{
+	const char *plan_name;
+	uint8_t close_type;
+	bool res;
+	bool ok;
+
+	if (incomplete_pkt(pkt) || pkt->len < 1+4+1+1) {
+		disconnect_client(client, true, "broken close pkt");
+		return false;
+	}
+
+	/* S - prepared statement, P - portal */
+	ok = mbuf_get_byte(&pkt->data, &close_type);
+	if (!ok)
+		goto failed;
+	ok = mbuf_get_string(&pkt->data, &plan_name);
+	if (!ok)
+		goto failed;
+
+	if (close_type != 'S' || plan_name[0] == 0) {
+		sbuf_prepare_send(&client->sbuf, &client->link->sbuf, pkt->len);
+		return true;
+	}
+
+	if (!client_deallocate(client, plan_name)) {
+		disconnect_client(client, true, "unknown plan");
+		return false;
+	}
+
+	SEND_CloseComplete(res, client);
+	if (!res) {
+		disconnect_client(client, true, "send of CloseComplete failed");
+		return false;
+	}
+
+	sbuf_prepare_skip(&client->sbuf, pkt->len);
+	return true;
+failed:
+	disconnect_client(client, true, "invalid close packet");
+	return false;
+}
+
 static bool check_client_passwd(PgSocket *client, const char *passwd)
 {
 	char md5[MD5_PASSWD_LEN + 1];
@@ -324,9 +472,9 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	 * to buffer packets until sync or flush is sent by client
 	 */
 	case 'P':		/* Parse */
+	case 'B':		/* Bind */
 	case 'E':		/* Execute */
 	case 'C':		/* Close */
-	case 'B':		/* Bind */
 	case 'D':		/* Describe */
 	case 'd':		/* CopyData(F/B) */
 
@@ -349,8 +497,6 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		client->link->ready = false;
 		client->link->idle_tx = false;
 
-		/* forward the packet */
-		sbuf_prepare_send(sbuf, &client->link->sbuf, pkt->len);
 		break;
 
 	/* client wants to go away */
@@ -362,6 +508,20 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		disconnect_client(client, false, "client close request");
 		return false;
 	}
+
+	/* check for special packet types */
+	switch (pkt->type) {
+	case 'P': /* Parse */
+		return handle_parse(client, pkt);
+	case 'B': /* Bind */
+		return handle_bind(client, pkt);
+	case 'C': /* Close */
+		return handle_close(client, pkt);
+	default:
+		/* forward the packet */
+		sbuf_prepare_send(sbuf, &client->link->sbuf, pkt->len);
+	}
+
 	return true;
 }
 
@@ -426,7 +586,7 @@ bool client_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 		/* client is not interested in it */
 		break;
 	case SBUF_EV_PKT_CALLBACK:
-		/* unused ATM */
+		res = plan_load_part(client, data);
 		break;
 	}
 	return res;

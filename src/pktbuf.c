@@ -233,6 +233,15 @@ void pktbuf_put_bytes(PktBuf *buf, const void *data, int len)
 	buf->write_pos += len;
 }
 
+void pktbuf_move_bytes(PktBuf *buf, const void *data, int len)
+{
+	make_room(buf, len);
+	if (buf->failed)
+		return;
+	memmove(buf->buf + buf->write_pos, data, len);
+	buf->write_pos += len;
+}
+
 void pktbuf_put_string(PktBuf *buf, const char *str)
 {
 	int len = strlen(str);

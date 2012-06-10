@@ -57,7 +57,7 @@ static inline bool iobuf_sane(const IOBuf *io)
 	return (io == NULL) ||
 		(  io->parse_pos >= io->done_pos
 		&& io->recv_pos >= io->parse_pos
-		&& (unsigned)cf_sbuf_len >= io->recv_pos);
+		&& cf_sbuf_len >= io->recv_pos);
 }
 
 static inline bool iobuf_empty(const IOBuf *io)
@@ -119,6 +119,19 @@ static inline int _MUSTCHECK iobuf_recv_limit(IOBuf *io, int fd, unsigned len)
 	if (got > 0)
 		io->recv_pos += got;
 	return got;
+}
+
+static inline bool _MUSTCHECK iobuf_write(IOBuf *io, const void *data, int len)
+{
+	uint8_t *pos = io->buf + io->recv_pos;
+	int avail = iobuf_amount_recv(io);
+
+	if (len > avail)
+		return false;
+
+	memcpy(pos, data, len);
+	io->recv_pos += len;
+	return true;
 }
 
 static inline int _MUSTCHECK iobuf_recv_max(IOBuf *io, int fd)

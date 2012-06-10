@@ -65,7 +65,15 @@ static bool sbuf_call_proto(SBuf *sbuf, int event) /* _MUSTCHECK */;
 static bool sbuf_actual_recv(SBuf *sbuf, unsigned len)  _MUSTCHECK;
 static bool sbuf_after_connect_check(SBuf *sbuf)  _MUSTCHECK;
 
-static inline IOBuf *get_iobuf(SBuf *sbuf) { return sbuf->io; }
+static inline IOBuf *get_iobuf(void)
+{
+	return slab_alloc(iobuf_cache);
+}
+
+static inline void put_iobuf(IOBuf *io)
+{
+	slab_free(iobuf_cache, io);
+}
 
 /*********************************
  * Public functions
@@ -520,7 +528,7 @@ static void sbuf_try_resync(SBuf *sbuf, bool release)
 		log_noise("resync: done=%d, parse=%d, recv=%d",
 			  io->done_pos, io->parse_pos, io->recv_pos);
 	AssertActive(sbuf);
-
+#if 0
 	if (!io)
 		return;
 
@@ -529,6 +537,33 @@ static void sbuf_try_resync(SBuf *sbuf, bool release)
 		sbuf->io = NULL;
 	} else
 		iobuf_try_resync(io, SBUF_SMALL_PKT);
+#else
+	if (sbuf->io_next) {
+		if (sbuf->io && iobuf_empty(sbuf->io)) {
+			put_iobuf(sbuf->io);
+			sbuf->io = NULL;
+		}
+		if (sbuf->io == NULL) {
+			sbuf->io = sbuf->io_next;
+			sbuf->io_next = NULL;
+		}
+	} else if (!sbuf->io)
+		return;
+
+	if (release && iobuf_empty(sbuf->io)) {
+		put_iobuf(sbuf->io);
+		/* should not happen: */
+		if (sbuf->io_next) {
+			sbuf->io = sbuf->io_next;
+			sbuf->io_next = NULL;
+		} else {
+			sbuf->io = NULL;
+		}
+	} else {
+		/* FIXME - sync more if io_next? */
+		iobuf_try_resync(sbuf->io, SBUF_SMALL_PKT);
+	}
+#endif
 }
 
 /* actually ask kernel for more data */
@@ -564,12 +599,11 @@ static void sbuf_recv_cb(int sock, short flags, void *arg)
 static bool allocate_iobuf(SBuf *sbuf)
 {
 	if (sbuf->io == NULL) {
-		sbuf->io = slab_alloc(iobuf_cache);
+		sbuf->io = get_iobuf();
 		if (sbuf->io == NULL) {
 			sbuf_call_proto(sbuf, SBUF_EV_RECV_FAILED);
 			return false;
 		}
-		iobuf_reset(sbuf->io);
 	}
 	return true;
 }
@@ -713,5 +747,61 @@ bool sbuf_answer(SBuf *sbuf, const void *buf, unsigned len)
 	} else if ((unsigned)res != len)
 		log_debug("sbuf_answer: partial send: len=%d sent=%d", len, res);
 	return (unsigned)res == len;
+}
+
+bool sbuf_rewrite_header(SBuf *sbuf, int old_len,
+			 const uint8_t *new_hdr, int new_len)
+{
+	IOBuf *io = sbuf->io;
+	IOBuf *io2 = sbuf->io_next;
+	int free = cf_sbuf_len - io->recv_pos;
+	int diff = new_len - old_len;
+
+	AssertActive(sbuf);
+	Assert(old_len >= 0 && new_len >= 0);
+
+	if (diff > free && diff <= (int)io->done_pos) {
+		iobuf_try_resync(io, cf_sbuf_len);
+		free = cf_sbuf_len - io->recv_pos;
+	}
+	if (diff <= free) {
+		/* this buffer is enough */
+		uint8_t *pkt_pos = io->buf + io->parse_pos;
+		uint8_t *old_pos = pkt_pos + old_len;
+		uint8_t *new_pos = pkt_pos + new_len;
+		int data_len = io->recv_pos - (io->parse_pos + old_len);
+		memmove(new_pos, old_pos, data_len);
+		memcpy(pkt_pos, new_hdr, new_len);
+		io->recv_pos += diff;
+	} else {
+		/* new buf needed */
+		if (io2 == NULL) {
+			io2 = get_iobuf();
+			if (io2 == NULL)
+				return false;
+			sbuf->io_next = io2;
+		}
+
+		if (io->parse_pos + new_len > cf_sbuf_len) {
+			/* header itself does not fit */
+			uint8_t *old_data = io->buf + io->parse_pos + old_len;
+			int data_len = io->recv_pos - (io->parse_pos + old_len);
+			if (!iobuf_write(io2, new_hdr, new_len))
+				return false;
+			if (!iobuf_write(io2, old_data, data_len))
+				return false;
+		} else {
+			/* data does not fit */
+			uint8_t *old_data = io->buf + io->recv_pos - diff;
+			if (!iobuf_write(io2, old_data, diff))
+				return false;
+			io->recv_pos -= diff;
+			if (!sbuf_rewrite_header(sbuf, old_len, new_hdr, new_len))
+				return false;
+		}
+	}
+	Assert(iobuf_sane(io));
+	Assert(iobuf_sane(io2));
+	return true;
 }
 

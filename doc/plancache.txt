@@ -1,0 +1,10 @@
+
+
+ * Both client and server ->plan_cache can contain only plans that
+   were successfully parsed on server.
+ * global PlanBody cache _must_ contain partial plans ?!?.
+ * If plan already exists on server, send PLanOK response with MSG_MORE
+ * If plan does not exists on server, send directly to server, let server send response
+ * on start of new pkt need to check for unfinished plans
+ * parse data sending
+

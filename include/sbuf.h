@@ -73,6 +73,7 @@ struct SBuf {
 	SBuf *dst;		/* target SBuf for current packet */
 
 	IOBuf *io;		/* data buffer, lazily allocated */
+	IOBuf *io_next;		/* temp buffer */
 };
 
 #define sbuf_socket(sbuf) ((sbuf)->sock)
@@ -94,6 +95,8 @@ bool sbuf_answer(SBuf *sbuf, const void *buf, unsigned len)  _MUSTCHECK;
 
 bool sbuf_continue_with_callback(SBuf *sbuf, sbuf_libevent_cb cb)  _MUSTCHECK;
 
+bool sbuf_rewrite_header(SBuf *sbuf, int old_len,
+			 const uint8_t *new_hdr, int new_len) _MUSTCHECK;
 /*
  * Returns true if SBuf is has no data buffered
  * and is not in a middle of a packet.

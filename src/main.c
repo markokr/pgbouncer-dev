@@ -71,7 +71,7 @@ char *cf_unix_socket_group;
 int cf_pool_mode = POOL_SESSION;
 
 /* sbuf config */
-int cf_sbuf_len;
+unsigned int cf_sbuf_len;
 int cf_sbuf_loopcnt;
 int cf_tcp_socket_buffer;
 #if defined(TCP_DEFER_ACCEPT) || defined(SO_ACCEPTFILTER)
@@ -131,6 +131,8 @@ int cf_stats_period;
 int cf_log_connections;
 int cf_log_disconnections;
 int cf_log_pooler_errors;
+
+int cf_cache_plans = 0;
 
 /*
  * config file description
@@ -205,6 +207,7 @@ CF_ABS("server_login_retry", CF_TIME_USEC, cf_server_login_retry, 0, "15"),
 CF_ABS("server_round_robin", CF_INT, cf_server_round_robin, 0, "0"),
 CF_ABS("suspend_timeout", CF_TIME_USEC, cf_suspend_timeout, 0, "10"),
 CF_ABS("ignore_startup_parameters", CF_STR, cf_ignore_startup_params, 0, ""),
+CF_ABS("cache_plans", CF_INT, cf_cache_plans, CF_NO_RELOAD, "0"),
 CF_ABS("disable_pqexec", CF_INT, cf_disable_pqexec, CF_NO_RELOAD, "0"),
 CF_ABS("dns_max_ttl", CF_TIME_USEC, cf_dns_max_ttl, 0, "15"),
 CF_ABS("dns_zone_check_period", CF_TIME_USEC, cf_dns_zone_check_period, 0, "0"),
@@ -738,6 +741,7 @@ int main(int argc, char *argv[])
 	/* need to do that after loading config */
 	check_limits();
 
+	init_plan_cache();
 	admin_setup();
 
 	if (cf_reboot) {
